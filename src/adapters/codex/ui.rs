@@ -19,7 +19,6 @@ impl CodexAdapter {
                 .then_with(|| left.email.cmp(&right.email))
         });
         let mut usable_count = 0usize;
-        let has_api_account = accounts.iter().any(|account| account.is_api());
 
         let rows = accounts
             .into_iter()
@@ -72,18 +71,14 @@ impl CodexAdapter {
             })
             .collect::<Vec<_>>();
 
-        if usable_count == 0 && !has_api_account {
-            ui.no_usable_account_hint().to_string()
-        } else {
-            render_table(
-                &ui.table_headers(),
-                &rows,
-                &[
-                    "center", "left", "center", "center", "center", "center", "center", "center",
-                ],
-                Some(ui.usable_account_summary(usable_count)),
-            )
-        }
+        render_table(
+            &ui.table_headers(),
+            &rows,
+            &[
+                "center", "left", "center", "center", "center", "center", "center", "center",
+            ],
+            Some(ui.usable_account_summary(usable_count)),
+        )
     }
 }
 
@@ -463,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn render_account_table_returns_empty_state_message_when_no_account_is_usable() {
+    fn render_account_table_shows_error_status_when_none_usable() {
         let adapter = CodexAdapter;
         let mut state = State::default();
         state.accounts.push(AccountRecord {
@@ -481,9 +476,19 @@ mod tests {
         );
 
         let rendered = adapter.render_account_table(&state, None);
-        assert_eq!(
-            rendered,
-            crate::core::ui::messages().no_usable_account_hint()
+        let messages = crate::core::ui::messages();
+
+        assert!(
+            rendered.contains("a@example.com"),
+            "failed account row should still render"
+        );
+        assert!(
+            rendered.contains(messages.status_error()),
+            "status column should be marked error"
+        );
+        assert!(
+            rendered.contains(&messages.usable_account_summary(0)),
+            "summary should report zero usable accounts"
         );
     }
 
