@@ -157,6 +157,18 @@ static MSG_SELECTION_SWITCHED: Msg = Msg {
     en: "Switched to",
     zh: "已切换到",
 };
+static MSG_APP_SERVER_RESTARTING: Msg = Msg {
+    en: "Restarting Codex app-server so it loads the switched account. In-progress sessions on that process will stop.",
+    zh: "正在重启 Codex app-server，让它加载切换后的账号。该进程里进行中的会话会中断。",
+};
+static MSG_APP_SERVER_RESTART_FAILED: Msg = Msg {
+    en: "failed to restart Codex app-server, exit status {status}",
+    zh: "重启 Codex app-server 失败，退出码：{status}",
+};
+static MSG_APP_SERVER_RESTART_MISSING_CODEX: Msg = Msg {
+    en: "codex was not found, so the running app-server was not restarted",
+    zh: "未找到 codex，正在运行的 app-server 没有重启",
+};
 static MSG_SELECTION_WOULD_SELECT: Msg = Msg {
     en: "Would select",
     zh: "将会选择",
@@ -563,6 +575,21 @@ impl Messages {
 
     pub fn selection_switched(&self) -> &'static str {
         self.pick(&MSG_SELECTION_SWITCHED)
+    }
+
+    pub fn app_server_restarting(&self) -> &'static str {
+        self.pick(&MSG_APP_SERVER_RESTARTING)
+    }
+
+    pub fn app_server_restart_failed(&self, status: i32) -> String {
+        self.format_msg(
+            &MSG_APP_SERVER_RESTART_FAILED,
+            &[("{status}", status.to_string())],
+        )
+    }
+
+    pub fn app_server_restart_missing_codex(&self) -> &'static str {
+        self.pick(&MSG_APP_SERVER_RESTART_MISSING_CODEX)
     }
 
     pub fn selection_would_select(&self) -> &'static str {

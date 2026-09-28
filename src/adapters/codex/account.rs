@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -11,8 +12,8 @@ use super::ApiLoginRequest;
 use super::CodexAdapter;
 use super::auth::{chatgpt_identities_match, decode_identity, live_auth_is_newer};
 use super::now_ts;
-use super::paths::codex_home;
-use crate::core::state::{AccountRecord, AccountType, State};
+use super::paths::{codex_app_server_daemon_running, codex_home, find_codex_bin};
+use crate::core::state::{AccountRecord, AccountType, LiveIdentity, State};
 use crate::core::storage;
 
 const SCODEX_API_CONFIG_MARKER: &str = "# scodex-managed-api-config";
@@ -252,6 +253,7 @@ impl CodexAdapter {
         storage::ensure_exists(src, "stored auth.json")?;
         let home = codex_home();
         let dst = home.join("auth.json");
+        let identity_before = self.read_live_identity();
         if account.is_subscription()
             && dst.exists()
             && let Ok(live) = self.read_auth_json(&dst)
@@ -266,6 +268,39 @@ impl CodexAdapter {
         }
         atomic_copy(src, &dst)?;
         switch_config(&home, account)?;
+        // 文件先落盘，新 daemon 才会读到新账号
+        self.restart_app_server_if_identity_changed(&home, identity_before.as_ref())?;
+        Ok(())
+    }
+
+    /// 同一账号只换 token 时不打断正在跑的会话。
+    fn restart_app_server_if_identity_changed(
+        &self,
+        home: &Path,
+        identity_before: Option<&LiveIdentity>,
+    ) -> Result<()> {
+        if self.read_live_identity().as_ref() == identity_before {
+            return Ok(());
+        }
+        if !codex_app_server_daemon_running(home) {
+            return Ok(());
+        }
+        let ui = crate::core::ui::messages();
+        let Some(codex_bin) = find_codex_bin() else {
+            bail!("{}", ui.app_server_restart_missing_codex());
+        };
+        println!("{}", ui.app_server_restarting());
+        let status = Command::new(&codex_bin)
+            .args(["app-server", "daemon", "restart"])
+            .env("CODEX_HOME", home)
+            .status()
+            .with_context(|| format!("failed to execute {}", codex_bin.display()))?;
+        if !status.success() {
+            bail!(
+                "{}",
+                ui.app_server_restart_failed(status.code().unwrap_or(1))
+            );
+        }
         Ok(())
     }
 
@@ -1142,6 +1177,151 @@ mod tests {
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _codex = EnvGuard::set("CODEX_HOME", &live_home);
         CodexAdapter.switch_account(&subscription_record(&stored_auth, "b@example.com"))?;
+
+        let live: serde_json::Value = serde_json::from_str(&fs::read_to_string(&live_auth)?)?;
+        assert_eq!(
+            live.pointer("/tokens/access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("stored-b")
+        );
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    fn write_codex_stub(path: &Path, exit_code: i32) -> Result<()> {
+        let body = format!(
+            "#!/bin/sh\nif [ -n \"$SCODEX_RESTART_RECORD\" ]; then\n  printf '%s\\n' \"$@\" > \"$SCODEX_RESTART_RECORD\"\n  printf '%s\\n' \"$CODEX_HOME\" >> \"$SCODEX_RESTART_RECORD\"\nfi\nexit {exit_code}\n"
+        );
+        fs::write(path, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    }
+
+    fn write_running_daemon_pid(home: &Path) -> Result<()> {
+        let dir = home.join("app-server-daemon");
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("daemon.pid"),
+            format!(r#"{{"pid":{}}}"#, std::process::id()),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_restarts_running_daemon_when_identity_changes() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-switch-restart-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp)?;
+        let stored_home = tmp.join("stored");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&stored_home)?;
+        fs::create_dir_all(&live_home)?;
+        let stored_auth = stored_home.join("auth.json");
+        let live_auth = live_home.join("auth.json");
+        fs::write(
+            &stored_auth,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        fs::write(
+            &live_auth,
+            chatgpt_auth_file("a@example.com", "live-a", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+        write_running_daemon_pid(&live_home)?;
+        let record = tmp.join("record.txt");
+        let stub = tmp.join("codex-stub");
+        write_codex_stub(&stub, 0)?;
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _home = EnvGuard::set("CODEX_HOME", &live_home);
+        let _bin = EnvGuard::set("CODEX_BIN", &stub);
+        let _record = EnvGuard::set("SCODEX_RESTART_RECORD", &record);
+        CodexAdapter.switch_account(&subscription_record(&stored_auth, "b@example.com"))?;
+
+        let recorded = fs::read_to_string(&record)?;
+        let mut lines = recorded.lines();
+        assert_eq!(lines.next(), Some("app-server"));
+        assert_eq!(lines.next(), Some("daemon"));
+        assert_eq!(lines.next(), Some("restart"));
+        assert_eq!(lines.next(), Some(live_home.to_str().unwrap()));
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_skips_daemon_restart_when_daemon_is_not_running() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-switch-no-daemon-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp)?;
+        let stored_home = tmp.join("stored");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&stored_home)?;
+        fs::create_dir_all(&live_home)?;
+        let stored_auth = stored_home.join("auth.json");
+        let live_auth = live_home.join("auth.json");
+        fs::write(
+            &stored_auth,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        fs::write(
+            &live_auth,
+            chatgpt_auth_file("a@example.com", "live-a", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+        let record = tmp.join("record.txt");
+        let stub = tmp.join("codex-stub");
+        write_codex_stub(&stub, 0)?;
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _home = EnvGuard::set("CODEX_HOME", &live_home);
+        let _bin = EnvGuard::set("CODEX_BIN", &stub);
+        let _record = EnvGuard::set("SCODEX_RESTART_RECORD", &record);
+        CodexAdapter.switch_account(&subscription_record(&stored_auth, "b@example.com"))?;
+
+        assert!(!record.exists());
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_keeps_new_auth_when_daemon_restart_fails() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp =
+            std::env::temp_dir().join(format!("scodex-switch-restart-fail-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp)?;
+        let stored_home = tmp.join("stored");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&stored_home)?;
+        fs::create_dir_all(&live_home)?;
+        let stored_auth = stored_home.join("auth.json");
+        let live_auth = live_home.join("auth.json");
+        fs::write(
+            &stored_auth,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        fs::write(
+            &live_auth,
+            chatgpt_auth_file("a@example.com", "live-a", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+        write_running_daemon_pid(&live_home)?;
+        let stub = tmp.join("codex-stub");
+        write_codex_stub(&stub, 1)?;
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _home = EnvGuard::set("CODEX_HOME", &live_home);
+        let _bin = EnvGuard::set("CODEX_BIN", &stub);
+        let error = CodexAdapter
+            .switch_account(&subscription_record(&stored_auth, "b@example.com"))
+            .expect_err("restart failure should surface");
+        assert!(
+            error.to_string().contains("app-server"),
+            "unexpected error: {error}"
+        );
 
         let live: serde_json::Value = serde_json::from_str(&fs::read_to_string(&live_auth)?)?;
         assert_eq!(

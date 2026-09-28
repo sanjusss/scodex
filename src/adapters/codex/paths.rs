@@ -27,6 +27,54 @@ pub(super) fn codex_home() -> PathBuf {
     }
 }
 
+/// 已在运行的 app-server 不会重新读取 auth.json。只在 pid 文件对应进程仍存活时重启，避免把没启动的后台拉起来。
+pub(super) fn codex_app_server_daemon_running(codex_home: &Path) -> bool {
+    let pid_path = codex_home.join("app-server-daemon").join("daemon.pid");
+    let Ok(contents) = fs::read_to_string(pid_path) else {
+        return false;
+    };
+    parse_daemon_pid(&contents).is_some_and(process_is_running)
+}
+
+fn parse_daemon_pid(contents: &str) -> Option<u32> {
+    let trimmed = contents.trim();
+    if let Ok(pid) = trimmed.parse::<u32>() {
+        return (pid > 0).then_some(pid);
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let pid = value.get("pid")?.as_u64()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let pid = pid.to_string();
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        let Ok(output) = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .split(',')
+            .any(|field| field.trim().trim_matches('"') == pid)
+    }
+}
+
 pub(super) fn codex_install_command() -> InstallCommand {
     InstallCommand {
         program: npm_command_name().to_string(),
@@ -221,9 +269,39 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        codex_install_command, find_in_path_filtered, is_windows_interop_path,
-        wsl_detected_from_signals,
+        codex_app_server_daemon_running, codex_install_command, find_in_path_filtered,
+        is_windows_interop_path, parse_daemon_pid, wsl_detected_from_signals,
     };
+
+    #[test]
+    fn daemon_pid_accepts_plain_integer_and_json_record() {
+        assert_eq!(parse_daemon_pid("405891\n"), Some(405891));
+        assert_eq!(
+            parse_daemon_pid(r#"{"pid":405891,"processStartTime":"ignored"}"#),
+            Some(405891)
+        );
+        assert_eq!(parse_daemon_pid("0"), None);
+        assert_eq!(parse_daemon_pid("not-a-pid"), None);
+    }
+
+    #[test]
+    fn daemon_running_follows_pid_file() {
+        let home = std::env::temp_dir().join(format!("scodex-daemon-pid-{}", std::process::id()));
+        let dir = home.join("app-server-daemon");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!codex_app_server_daemon_running(&home));
+
+        std::fs::write(
+            dir.join("daemon.pid"),
+            format!(r#"{{"pid":{}}}"#, std::process::id()),
+        )
+        .unwrap();
+        assert!(codex_app_server_daemon_running(&home));
+
+        std::fs::write(dir.join("daemon.pid"), "2147483646\n").unwrap();
+        assert!(!codex_app_server_daemon_running(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn install_command_uses_official_npm_package() {
