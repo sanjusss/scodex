@@ -256,18 +256,19 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Command::Use(args) => {
             adapter.import_known_sources(&state_dir, &mut state);
-            let Some(record) = adapter.find_account_by_email(&state, &args.email) else {
+            let Some(found) = adapter.find_account_by_email(&state, &args.email) else {
                 println!("{}", ui.unknown_account(&args.email));
                 storage::save_state(&state_dir, &state)?;
                 return Ok(1);
             };
-            adapter.switch_account(record)?;
+            let record = found.clone();
+            adapter.switch_account(&state_dir, &mut state, &record)?;
             let usage = state
                 .usage_cache
                 .get(&record.id)
                 .cloned()
                 .unwrap_or_default();
-            print_selection(ui.selection_switched(), record, &usage);
+            print_selection(ui.selection_switched(), &record, &usage);
             storage::save_state(&state_dir, &state)?;
             0
         }
@@ -461,7 +462,7 @@ fn finish_added_account(
     let ui = ui::messages();
     let usage = adapter.refresh_account_usage(state, record);
     println!("{}", ui.added_account(&record.email));
-    adapter.switch_account(record)?;
+    adapter.switch_account(state_dir, state, record)?;
     print_selection(ui.selection_switched(), record, &usage);
     storage::save_state(state_dir, state)?;
     Ok(0)

@@ -138,7 +138,7 @@ impl CodexAdapter {
             let record = self.run_device_auth_login(state_dir, state)?;
             let usage = self.refresh_account_usage(state, &record);
             if perform_switch {
-                self.switch_account(&record)?;
+                self.switch_account(state_dir, state, &record)?;
             }
             return Ok(Some((record, usage)));
         }
@@ -147,7 +147,7 @@ impl CodexAdapter {
         if let Some(current) = choose_current_api_account(state, live_identity.as_ref()).cloned() {
             let usage = UsageSnapshot::default();
             if perform_switch {
-                self.switch_account(&current)?;
+                self.switch_account(state_dir, state, &current)?;
             }
             return Ok(Some((current, usage)));
         }
@@ -160,7 +160,7 @@ impl CodexAdapter {
                 .cloned()
                 .unwrap_or_default();
             if perform_switch {
-                self.switch_account(&current)?;
+                self.switch_account(state_dir, state, &current)?;
             }
             return Ok(Some((current, usage)));
         }
@@ -168,7 +168,7 @@ impl CodexAdapter {
         if let Some(best) = choose_best_account(state).cloned() {
             let usage = state.usage_cache.get(&best.id).cloned().unwrap_or_default();
             if perform_switch {
-                self.switch_account(&best)?;
+                self.switch_account(state_dir, state, &best)?;
             }
             return Ok(Some((best, usage)));
         }

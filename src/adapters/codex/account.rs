@@ -18,6 +18,7 @@ use crate::core::storage;
 
 const SCODEX_API_CONFIG_MARKER: &str = "# scodex-managed-api-config";
 const SCODEX_ACCOUNT_ID_PREFIX: &str = "# scodex-account-id: ";
+const SCODEX_KEEP_CONFIG_MARKER: &str = "# scodex-keep-config";
 
 impl CodexAdapter {
     pub fn normalize_account_records(&self, state: &mut State) -> bool {
@@ -248,26 +249,42 @@ impl CodexAdapter {
             .find(|account| account.email.eq_ignore_ascii_case(&target))
     }
 
-    pub fn switch_account(&self, account: &AccountRecord) -> Result<()> {
-        let src = Path::new(&account.auth_path);
-        storage::ensure_exists(src, "stored auth.json")?;
+    pub fn switch_account(
+        &self,
+        state_dir: &Path,
+        state: &mut State,
+        account: &AccountRecord,
+    ) -> Result<()> {
+        let incoming_auth = PathBuf::from(&account.auth_path);
+        storage::ensure_exists(&incoming_auth, "stored auth.json")?;
         let home = codex_home();
         let dst = home.join("auth.json");
         let identity_before = self.read_live_identity();
+        let account_id = account.id.clone();
+        // 替换 auth.json 之后，live 凭据属于目标账号，配置归属必须在这之前判定。
+        persist_live_config(self, state_dir, state)?;
+        let account = state
+            .accounts
+            .iter()
+            .find(|item| item.id == account_id)
+            .cloned()
+            .unwrap_or_else(|| account.clone());
+        let src = PathBuf::from(&account.auth_path);
+        storage::ensure_exists(&src, "stored auth.json")?;
         if account.is_subscription()
             && dst.exists()
             && let Ok(live) = self.read_auth_json(&dst)
-            && let Ok(stored) = self.read_auth_json(src)
+            && let Ok(stored) = self.read_auth_json(&src)
             && chatgpt_identities_match(&live, &stored)
             && live_auth_is_newer(&live, &stored)
         {
             // live 已是同一账号且更新：吸收到仓库，禁止用过期副本覆盖 live
-            atomic_copy(&dst, src)?;
-            switch_config(&home, account)?;
+            atomic_copy(&dst, &src)?;
+            switch_config(&home, &account)?;
             return Ok(());
         }
-        atomic_copy(src, &dst)?;
-        switch_config(&home, account)?;
+        atomic_copy(&src, &dst)?;
+        switch_config(&home, &account)?;
         // 文件先落盘，新 daemon 才会读到新账号
         self.restart_app_server_if_identity_changed(&home, identity_before.as_ref())?;
         Ok(())
@@ -486,7 +503,87 @@ pub(super) fn read_managed_config_account_id(codex_home: &Path) -> Option<String
     })
 }
 
+fn live_config_is_kept(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|contents| contents.contains(SCODEX_KEEP_CONFIG_MARKER))
+        .unwrap_or(false)
+}
+
+fn read_config_account_id(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix(SCODEX_ACCOUNT_ID_PREFIX)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn live_subscription_owner_id(adapter: &CodexAdapter, state: &State) -> Option<String> {
+    let auth = adapter
+        .read_auth_json(&codex_home().join("auth.json"))
+        .ok()?;
+    let identity = decode_identity(&auth).ok()?;
+    find_matching_account(state, &identity.email, identity.account_id.as_deref())
+        .filter(|account| account.is_subscription())
+        .map(|account| account.id.clone())
+}
+
+fn persist_live_config(adapter: &CodexAdapter, state_dir: &Path, state: &mut State) -> Result<()> {
+    let live_config = codex_home().join("config.toml");
+    // 用户钉住的配置不属于任何一个账号，不能写进账号目录。
+    if !live_config.exists() || live_config_is_kept(&live_config) {
+        return Ok(());
+    }
+
+    let owner_id = match read_config_account_id(&live_config) {
+        Some(account_id) => {
+            if state
+                .accounts
+                .iter()
+                .any(|account| account.id == account_id)
+            {
+                Some(account_id)
+            } else {
+                // 文件已经标明账号。对不上时不能再按当前凭据写到另一个账号。
+                return Ok(());
+            }
+        }
+        None => live_subscription_owner_id(adapter, state),
+    };
+    let Some(owner_id) = owner_id else {
+        return Ok(());
+    };
+
+    let dest = state_dir
+        .join("accounts")
+        .join(&owner_id)
+        .join("config.toml");
+    let live_bytes = fs::read(&live_config)
+        .with_context(|| format!("failed to read {}", live_config.display()))?;
+    let same_content = fs::read(&dest).is_ok_and(|stored| stored == live_bytes);
+    if !same_content {
+        atomic_copy(&live_config, &dest)?;
+    }
+
+    let canonical = dest.to_string_lossy().into_owned();
+    if let Some(slot) = state
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == owner_id)
+    {
+        if slot.config_path.as_deref() != Some(canonical.as_str()) {
+            slot.config_path = Some(canonical);
+        }
+    }
+    Ok(())
+}
+
 fn switch_config(codex_home: &Path, account: &AccountRecord) -> Result<()> {
+    // 标记存在时，live config.toml 在任何切换路径下都保持原样。
+    if live_config_is_kept(&codex_home.join("config.toml")) {
+        return Ok(());
+    }
     if account.is_api() {
         let Some(config_path) = account.config_path.as_ref() else {
             return Ok(());
@@ -1076,6 +1173,11 @@ mod tests {
         }
     }
 
+    fn switch_with_empty_state(state_dir: &Path, account: &AccountRecord) -> Result<()> {
+        let mut state = State::default();
+        CodexAdapter.switch_account(state_dir, &mut state, account)
+    }
+
     #[test]
     fn switch_account_absorbs_newer_live_instead_of_overwriting() -> Result<()> {
         use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
@@ -1099,7 +1201,7 @@ mod tests {
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _codex = EnvGuard::set("CODEX_HOME", &live_home);
-        CodexAdapter.switch_account(&subscription_record(&stored_auth, "a@example.com"))?;
+        switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "a@example.com"))?;
 
         let live: serde_json::Value = serde_json::from_str(&fs::read_to_string(&live_auth)?)?;
         let stored: serde_json::Value = serde_json::from_str(&fs::read_to_string(&stored_auth)?)?;
@@ -1141,7 +1243,7 @@ mod tests {
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _codex = EnvGuard::set("CODEX_HOME", &live_home);
-        CodexAdapter.switch_account(&subscription_record(&stored_auth, "a@example.com"))?;
+        switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "a@example.com"))?;
 
         let live: serde_json::Value = serde_json::from_str(&fs::read_to_string(&live_auth)?)?;
         assert_eq!(
@@ -1176,7 +1278,7 @@ mod tests {
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _codex = EnvGuard::set("CODEX_HOME", &live_home);
-        CodexAdapter.switch_account(&subscription_record(&stored_auth, "b@example.com"))?;
+        switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "b@example.com"))?;
 
         let live: serde_json::Value = serde_json::from_str(&fs::read_to_string(&live_auth)?)?;
         assert_eq!(
@@ -1240,7 +1342,7 @@ mod tests {
         let _home = EnvGuard::set("CODEX_HOME", &live_home);
         let _bin = EnvGuard::set("CODEX_BIN", &stub);
         let _record = EnvGuard::set("SCODEX_RESTART_RECORD", &record);
-        CodexAdapter.switch_account(&subscription_record(&stored_auth, "b@example.com"))?;
+        switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "b@example.com"))?;
 
         let recorded = fs::read_to_string(&record)?;
         let mut lines = recorded.lines();
@@ -1280,7 +1382,7 @@ mod tests {
         let _home = EnvGuard::set("CODEX_HOME", &live_home);
         let _bin = EnvGuard::set("CODEX_BIN", &stub);
         let _record = EnvGuard::set("SCODEX_RESTART_RECORD", &record);
-        CodexAdapter.switch_account(&subscription_record(&stored_auth, "b@example.com"))?;
+        switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "b@example.com"))?;
 
         assert!(!record.exists());
         fs::remove_dir_all(&tmp)?;
@@ -1315,9 +1417,9 @@ mod tests {
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _home = EnvGuard::set("CODEX_HOME", &live_home);
         let _bin = EnvGuard::set("CODEX_BIN", &stub);
-        let error = CodexAdapter
-            .switch_account(&subscription_record(&stored_auth, "b@example.com"))
-            .expect_err("restart failure should surface");
+        let error =
+            switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "b@example.com"))
+                .expect_err("restart failure should surface");
         assert!(
             error.to_string().contains("app-server"),
             "unexpected error: {error}"
@@ -1329,6 +1431,357 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("stored-b")
         );
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    fn stored_subscription(
+        id: &str,
+        auth_path: &Path,
+        email: &str,
+        config_path: Option<&Path>,
+        updated_at: i64,
+    ) -> AccountRecord {
+        AccountRecord {
+            id: id.into(),
+            account_type: AccountType::Subscription,
+            email: email.into(),
+            account_id: Some(format!("acct-{email}")),
+            auth_path: auth_path.to_string_lossy().into_owned(),
+            config_path: config_path.map(|path| path.to_string_lossy().into_owned()),
+            updated_at,
+            ..AccountRecord::default()
+        }
+    }
+
+    #[test]
+    fn switch_keep_marker_preserves_live_config() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-keep-config-{}", Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&live_home)?;
+        let (_home_b, auth_b, config_b) = account_home_paths(&state_dir, "acct-b");
+        let auth_a = state_dir.join("accounts").join("acct-a").join("auth.json");
+        fs::create_dir_all(auth_a.parent().unwrap())?;
+        fs::create_dir_all(auth_b.parent().unwrap())?;
+        fs::write(
+            &auth_a,
+            chatgpt_auth_file("a@example.com", "stored-a", "2026-08-01T00:00:00Z").to_string(),
+        )?;
+        fs::write(
+            &auth_b,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        fs::write(&config_b, "model = \"from-b\"\n")?;
+        let kept = "# scodex-keep-config\nmodel = \"kept\"\n";
+        fs::write(live_home.join("config.toml"), kept)?;
+        fs::write(
+            live_home.join("auth.json"),
+            chatgpt_auth_file("a@example.com", "live-a", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+
+        let mut state = State::default();
+        state.accounts.push(stored_subscription(
+            "acct-a",
+            &auth_a,
+            "a@example.com",
+            None,
+            4,
+        ));
+        let record_b = stored_subscription("acct-b", &auth_b, "b@example.com", Some(&config_b), 5);
+        state.accounts.push(record_b.clone());
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_b)?;
+
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, kept);
+        assert!(
+            !state_dir
+                .join("accounts")
+                .join("acct-a")
+                .join("config.toml")
+                .exists()
+        );
+        assert!(!live_home.join("config.toml.scodex-backup").exists());
+        let live_auth: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(live_home.join("auth.json"))?)?;
+        assert_eq!(
+            live_auth
+                .pointer("/tokens/access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("stored-b")
+        );
+        assert_eq!(
+            state
+                .accounts
+                .iter()
+                .find(|account| account.id == "acct-a")
+                .and_then(|account| account.config_path.as_deref()),
+            None
+        );
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_persists_live_config_and_restores_it() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-config-roundtrip-{}", Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&live_home)?;
+        let (_home_a, auth_a, config_a) = account_home_paths(&state_dir, "acct-a");
+        let (_home_b, auth_b, config_b) = account_home_paths(&state_dir, "acct-b");
+        fs::create_dir_all(auth_a.parent().unwrap())?;
+        fs::create_dir_all(auth_b.parent().unwrap())?;
+        fs::write(
+            &auth_a,
+            chatgpt_auth_file("a@example.com", "stored-a", "2026-08-01T00:00:00Z").to_string(),
+        )?;
+        fs::write(
+            &auth_b,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        let from_b = "model = \"from-b\"\n";
+        fs::write(&config_b, from_b)?;
+        let edited = "model = \"edited-a\"\n";
+        fs::write(live_home.join("config.toml"), edited)?;
+        fs::write(
+            live_home.join("auth.json"),
+            chatgpt_auth_file("a@example.com", "live-a", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+
+        let mut state = State::default();
+        state.accounts.push(stored_subscription(
+            "acct-a",
+            &auth_a,
+            "a@example.com",
+            None,
+            11,
+        ));
+        let record_b = stored_subscription("acct-b", &auth_b, "b@example.com", Some(&config_b), 8);
+        state.accounts.push(record_b.clone());
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_b)?;
+
+        assert_eq!(fs::read_to_string(&config_a)?, edited);
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, from_b);
+        let record_a = {
+            let saved_a = state
+                .accounts
+                .iter()
+                .find(|account| account.id == "acct-a")
+                .unwrap();
+            assert_eq!(saved_a.updated_at, 11);
+            assert_eq!(
+                saved_a.config_path.as_deref(),
+                Some(config_a.to_str().unwrap())
+            );
+            saved_a.clone()
+        };
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_a)?;
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, edited);
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_same_account_keeps_live_config_edits() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-config-same-{}", Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&live_home)?;
+        let (_home_a, auth_a, config_a) = account_home_paths(&state_dir, "acct-a");
+        fs::create_dir_all(auth_a.parent().unwrap())?;
+        fs::write(
+            &auth_a,
+            chatgpt_auth_file("a@example.com", "stored-new", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+        fs::write(&config_a, "model = \"old-a\"\n")?;
+        let edited = "model = \"edited-a\"\n";
+        fs::write(live_home.join("config.toml"), edited)?;
+        fs::write(
+            live_home.join("auth.json"),
+            chatgpt_auth_file("a@example.com", "live-old", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+
+        let mut state = State::default();
+        let record_a = stored_subscription("acct-a", &auth_a, "a@example.com", Some(&config_a), 11);
+        state.accounts.push(record_a.clone());
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_a)?;
+
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, edited);
+        assert_eq!(fs::read_to_string(&config_a)?, edited);
+        assert_eq!(state.accounts[0].updated_at, 11);
+        let live_auth: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(live_home.join("auth.json"))?)?;
+        assert_eq!(
+            live_auth
+                .pointer("/tokens/access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("stored-new")
+        );
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_unknown_live_account_does_not_store_config() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-config-unknown-{}", Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&live_home)?;
+        let (_home_b, auth_b, config_b) = account_home_paths(&state_dir, "acct-b");
+        fs::create_dir_all(auth_b.parent().unwrap())?;
+        fs::write(
+            &auth_b,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        let from_b = "model = \"from-b\"\n";
+        fs::write(&config_b, from_b)?;
+        fs::write(live_home.join("config.toml"), "model = \"stray\"\n")?;
+        fs::write(
+            live_home.join("auth.json"),
+            chatgpt_auth_file("c@example.com", "live-c", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+
+        let mut state = State::default();
+        let record_b = stored_subscription("acct-b", &auth_b, "b@example.com", Some(&config_b), 5);
+        state.accounts.push(record_b.clone());
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_b)?;
+
+        let names = fs::read_dir(state_dir.join("accounts"))?
+            .map(|entry| entry.map(|item| item.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(names, vec![std::ffi::OsString::from("acct-b")]);
+        assert_eq!(fs::read_to_string(&config_b)?, from_b);
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, from_b);
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_marked_unknown_account_does_not_attach_config_to_auth_owner() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-config-marked-{}", Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&live_home)?;
+        let (_home_b, auth_b, config_b) = account_home_paths(&state_dir, "acct-b");
+        fs::create_dir_all(auth_b.parent().unwrap())?;
+        fs::write(
+            &auth_b,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        let from_b = "model = \"from-b\"\n";
+        fs::write(&config_b, from_b)?;
+        fs::write(
+            live_home.join("config.toml"),
+            "# scodex-account-id: missing-id\nmodel = \"stray\"\n",
+        )?;
+        fs::write(
+            live_home.join("auth.json"),
+            chatgpt_auth_file("b@example.com", "live-b", "2026-09-04T01:01:08Z").to_string(),
+        )?;
+
+        let mut state = State::default();
+        let record_b = stored_subscription("acct-b", &auth_b, "b@example.com", Some(&config_b), 5);
+        state.accounts.push(record_b.clone());
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_b)?;
+
+        assert!(!state_dir.join("accounts").join("missing-id").exists());
+        assert_eq!(fs::read_to_string(&config_b)?, from_b);
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, from_b);
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn switch_api_config_keeps_extra_fields() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-config-api-{}", Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&live_home)?;
+        let (_home_api, auth_api, config_api) = account_home_paths(&state_dir, "api-1");
+        let (_home_b, auth_b, config_b) = account_home_paths(&state_dir, "acct-b");
+        fs::create_dir_all(auth_api.parent().unwrap())?;
+        fs::create_dir_all(auth_b.parent().unwrap())?;
+        fs::write(
+            &auth_api,
+            serde_json::json!({ "OPENAI_API_KEY": "sk-abcdef123456wxyz" }).to_string(),
+        )?;
+        fs::write(
+            &auth_b,
+            chatgpt_auth_file("b@example.com", "stored-b", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        let base = build_api_config("api-1", &openrouter_request());
+        fs::write(&config_api, &base)?;
+        let edited = format!("{base}model = \"custom\"\n");
+        fs::write(live_home.join("config.toml"), &edited)?;
+        fs::write(
+            live_home.join("auth.json"),
+            "{\"OPENAI_API_KEY\":\"sk-live\"}",
+        )?;
+        let from_b = "model = \"from-b\"\n";
+        fs::write(&config_b, from_b)?;
+
+        let mut state = State::default();
+        state.accounts.push(AccountRecord {
+            id: "api-1".into(),
+            account_type: AccountType::Api,
+            email: "56wxyz@openrouter".into(),
+            auth_path: auth_api.to_string_lossy().into_owned(),
+            config_path: Some(config_api.to_string_lossy().into_owned()),
+            updated_at: 3,
+            ..AccountRecord::default()
+        });
+        let record_b = stored_subscription("acct-b", &auth_b, "b@example.com", Some(&config_b), 5);
+        state.accounts.push(record_b.clone());
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_b)?;
+
+        assert_eq!(fs::read_to_string(&config_api)?, edited);
+        assert_eq!(
+            state
+                .accounts
+                .iter()
+                .find(|account| account.id == "api-1")
+                .unwrap()
+                .updated_at,
+            3
+        );
+        let record_api = state
+            .accounts
+            .iter()
+            .find(|account| account.id == "api-1")
+            .unwrap()
+            .clone();
+        CodexAdapter.switch_account(&state_dir, &mut state, &record_api)?;
+        assert_eq!(fs::read_to_string(live_home.join("config.toml"))?, edited);
         fs::remove_dir_all(&tmp)?;
         Ok(())
     }
