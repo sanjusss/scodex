@@ -336,8 +336,8 @@ static TABLE_HEADER_MSGS: [Msg; 8] = [
     },
     Msg { en: "5h", zh: "5h" },
     Msg {
-        en: "Weekly",
-        zh: "每周",
+        en: "Window",
+        zh: "周期",
     },
     Msg {
         en: "ResetOn",
@@ -1071,11 +1071,11 @@ mod tests {
             language: UiLanguage::ZhHans,
         };
         let headers = msg.table_headers();
-        // 第 6 列（index 5）不应再是英文 "Weekly"
+        // 第 6 列（index 5）同时表示周额度和月额度，不能再显示英文 "Weekly"
         assert_ne!(
             headers[5], "Weekly",
-            "zh Weekly column should be translated"
+            "zh window column should be translated"
         );
-        assert_eq!(headers[5], "每周");
+        assert_eq!(headers[5], "周期");
     }
 }

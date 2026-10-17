@@ -349,8 +349,9 @@ impl CodexAdapter {
             && let Some(slot) = state.accounts.iter_mut().find(|item| item.id == account.id)
         {
             slot.updated_at = now_ts();
-            if slot.plan.is_none() {
-                slot.plan = identity.plan;
+            // id_token 里的套餐变化要覆盖导入时留下的旧值
+            if let Some(plan) = identity.plan.filter(|plan| !plan.trim().is_empty()) {
+                slot.plan = Some(plan);
             }
         }
     }
@@ -1176,6 +1177,50 @@ mod tests {
     fn switch_with_empty_state(state_dir: &Path, account: &AccountRecord) -> Result<()> {
         let mut state = State::default();
         CodexAdapter.switch_account(state_dir, &mut state, account)
+    }
+
+    #[test]
+    fn absorb_newer_live_auth_overwrites_existing_plan() -> Result<()> {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-absorb-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp)?;
+        let stored_home = tmp.join("stored");
+        let live_home = tmp.join("live");
+        fs::create_dir_all(&stored_home)?;
+        fs::create_dir_all(&live_home)?;
+        let stored_auth = stored_home.join("auth.json");
+        fs::write(
+            &stored_auth,
+            chatgpt_auth_file("a@example.com", "stored-old", "2026-08-24T07:28:44Z").to_string(),
+        )?;
+        let live = serde_json::json!({
+            "last_refresh": "2026-09-04T01:01:08Z",
+            "tokens": {
+                "access_token": "live-new",
+                "refresh_token": "rt-live-new",
+                "id_token": fake_jwt(
+                    r#"{"email":"a@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"free"}}"#
+                ),
+                "account_id": "acct-a@example.com"
+            }
+        });
+        fs::write(live_home.join("auth.json"), live.to_string())?;
+
+        let mut record = subscription_record(&stored_auth, "a@example.com");
+        record.plan = Some("Pro".into());
+        let mut state = State {
+            accounts: vec![record],
+            ..State::default()
+        };
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        CodexAdapter.absorb_newer_live_auth(&mut state);
+
+        assert_eq!(state.accounts[0].plan.as_deref(), Some("Free"));
+        fs::remove_dir_all(&tmp)?;
+        Ok(())
     }
 
     #[test]

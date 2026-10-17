@@ -28,7 +28,9 @@ impl CodexAdapter {
                     .get(&account.id)
                     .cloned()
                     .unwrap_or_default();
-                if account.is_subscription() && account_is_usable(&usage) {
+                if account.is_subscription()
+                    && crate::core::policy::is_subscription_account_usable(&usage)
+                {
                     usable_count += 1;
                 }
                 let leading_cells = vec![
@@ -50,19 +52,28 @@ impl CodexAdapter {
                         span_align: "center",
                     }
                 } else {
-                    let plan = account
+                    let plan = usage
                         .plan
                         .clone()
-                        .or(usage.plan.clone())
+                        .filter(|value| !value.trim().is_empty())
+                        .or(account.plan.clone())
+                        .filter(|value| !value.trim().is_empty())
                         .unwrap_or_else(|| ui.unknown().into());
+                    let long_window_percent = usage
+                        .weekly_remaining_percent
+                        .or(usage.monthly_remaining_percent);
+                    let long_window_reset = usage
+                        .weekly_refresh_at
+                        .as_deref()
+                        .or(usage.monthly_refresh_at.as_deref());
                     TableRow::Cells(
                         leading_cells
                             .into_iter()
                             .chain([
                                 plan,
                                 format_quota_percent(usage.five_hour_remaining_percent),
-                                format_quota_percent(usage.weekly_remaining_percent),
-                                format_reset_on(usage.weekly_refresh_at.as_deref()),
+                                format_quota_percent(long_window_percent),
+                                format_reset_on(long_window_reset),
                                 format_account_status(&usage),
                             ])
                             .collect(),
@@ -170,10 +181,6 @@ fn format_account_status(usage: &UsageSnapshot) -> String {
     } else {
         style_text(ui.status_ok(), AnsiStyle::Green)
     }
-}
-
-fn account_is_usable(usage: &UsageSnapshot) -> bool {
-    !usage.needs_relogin && usage.last_sync_error.is_none()
 }
 
 fn active_account_marker() -> String {
@@ -636,6 +643,81 @@ mod tests {
         // clean bottom border (no column dividers)
         assert_eq!(lines.last().and_then(|line| line.chars().next()), Some('└'));
         assert!(!lines.last().unwrap().contains('┴'));
+    }
+
+    #[test]
+    fn render_account_table_prefers_usage_plan_and_excludes_free_from_usable_count() {
+        let adapter = CodexAdapter;
+        let mut state = State::default();
+        state.accounts.push(AccountRecord {
+            id: "acct-1".into(),
+            email: "free@example.com".into(),
+            plan: Some("Plus".into()),
+            auth_path: "/tmp/auth.json".into(),
+            ..Default::default()
+        });
+        state.usage_cache.insert(
+            "acct-1".into(),
+            UsageSnapshot {
+                plan: Some("Free".into()),
+                five_hour_remaining_percent: Some(100),
+                weekly_remaining_percent: Some(100),
+                ..Default::default()
+            },
+        );
+
+        let rendered = strip_ansi(&adapter.render_account_table(&state, None));
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("free@example.com"))
+            .expect("free account row");
+        assert!(row.contains("Free"));
+        assert!(!row.contains("Plus"));
+        let summary = crate::core::ui::messages().usable_account_summary(0);
+        assert!(rendered.contains(&summary));
+    }
+
+    #[test]
+    fn render_account_table_shows_monthly_quota_outside_five_hour_column() {
+        let adapter = CodexAdapter;
+        let mut state = State::default();
+        state.accounts.push(AccountRecord {
+            id: "acct-1".into(),
+            email: "month@example.com".into(),
+            plan: Some("Pro".into()),
+            auth_path: "/tmp/auth.json".into(),
+            ..Default::default()
+        });
+        state.usage_cache.insert(
+            "acct-1".into(),
+            UsageSnapshot {
+                plan: Some("Free".into()),
+                monthly_remaining_percent: Some(100),
+                monthly_refresh_at: Some("2026-11-16T07:57:37Z".into()),
+                ..Default::default()
+            },
+        );
+
+        let rendered = strip_ansi(&adapter.render_account_table(&state, None));
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("month@example.com"))
+            .expect("monthly account row");
+        let cells = row
+            .split('│')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        let email_index = cells
+            .iter()
+            .position(|cell| *cell == "month@example.com")
+            .expect("email cell");
+        let na = crate::core::ui::messages().na();
+        assert_eq!(cells[email_index + 2], "Free");
+        assert_eq!(cells[email_index + 3], na);
+        assert_eq!(cells[email_index + 4], "100%");
+        assert_ne!(cells[email_index + 5], na);
+        assert!(!cells[email_index + 5].is_empty());
     }
 
     #[test]

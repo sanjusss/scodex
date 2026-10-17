@@ -62,6 +62,10 @@ pub struct UsageSnapshot {
     #[serde(default)]
     pub five_hour_refresh_at: Option<String>,
     #[serde(default)]
+    pub monthly_remaining_percent: Option<i64>,
+    #[serde(default)]
+    pub monthly_refresh_at: Option<String>,
+    #[serde(default)]
     pub credits_balance: Option<f64>,
     #[serde(default)]
     pub last_synced_at: Option<i64>,

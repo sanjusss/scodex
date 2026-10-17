@@ -62,40 +62,66 @@ fn is_current_account_usable(usage: &UsageSnapshot) -> bool {
     is_subscription_account_usable(usage)
 }
 
-fn is_subscription_account_usable(usage: &UsageSnapshot) -> bool {
+pub(crate) fn is_subscription_account_usable(usage: &UsageSnapshot) -> bool {
     if usage.needs_relogin || usage.last_sync_error.is_some() {
         return false;
     }
+    // free 不参与自动选号，即使额度窗口看起来充足
+    if is_free_plan(usage.plan.as_deref()) {
+        return false;
+    }
 
-    let has_any_window =
-        usage.weekly_remaining_percent.is_some() || usage.five_hour_remaining_percent.is_some();
+    let has_any_window = usage.weekly_remaining_percent.is_some()
+        || usage.five_hour_remaining_percent.is_some()
+        || usage.monthly_remaining_percent.is_some();
     if !has_any_window {
         return false;
     }
 
-    let weekly_ok = match usage.weekly_remaining_percent {
+    let long_window_ok = match usage.weekly_remaining_percent {
         Some(value) => value > 5,
-        None => true,
+        None => match usage.monthly_remaining_percent {
+            Some(value) => value > 5,
+            None => true,
+        },
     };
     let five_hour_ok = match usage.five_hour_remaining_percent {
         Some(value) => (value as f64) >= CURRENT_ACCOUNT_MIN_FIVE_HOUR_PERCENT,
         None => true,
     };
 
-    weekly_ok && five_hour_ok
+    long_window_ok && five_hour_ok
+}
+
+fn is_free_plan(plan: Option<&str>) -> bool {
+    plan.is_some_and(|value| value.trim().eq_ignore_ascii_case("free"))
+}
+
+fn long_window_remaining_percent(usage: &UsageSnapshot) -> Option<i64> {
+    usage
+        .weekly_remaining_percent
+        .or(usage.monthly_remaining_percent)
+}
+
+fn long_window_refresh_at(usage: &UsageSnapshot) -> Option<String> {
+    usage
+        .weekly_refresh_at
+        .clone()
+        .or_else(|| usage.monthly_refresh_at.clone())
 }
 
 fn build_score(account: &AccountRecord, usage: &UsageSnapshot) -> (i64, i64, i64, f64, i64, i64) {
+    let long_window = long_window_remaining_percent(usage);
     let five_hour_key = match usage.five_hour_remaining_percent {
         Some(value) => quota_score(Some(value)),
-        // 无 5h 窗口时用 weekly 分档顶上，避免 weekly-only 被 -1 罚到最后
-        None => quota_score(usage.weekly_remaining_percent),
+        // 无 5h 窗口时用周额度，再没有则用月额度，避免长周期账号被 -1 罚到最后
+        None => quota_score(long_window),
     };
     (
         five_hour_key,
-        quota_score(usage.weekly_remaining_percent),
+        quota_score(long_window),
         // 重置时间戳越早（数值越小）越优先；缺失视为无限远，排到最差
-        parse_refresh_ts(&usage.weekly_refresh_at),
+        parse_refresh_ts(&long_window_refresh_at(usage)),
         usage.credits_balance.unwrap_or(-1.0),
         usage.last_synced_at.unwrap_or(0),
         account.updated_at,
@@ -331,6 +357,119 @@ mod tests {
         };
 
         assert!(!is_current_account_usable(&usage));
+    }
+
+    #[test]
+    fn free_plan_with_full_quota_is_not_usable() {
+        for plan in ["free", "Free", " FREE "] {
+            let usage = UsageSnapshot {
+                plan: Some(plan.into()),
+                five_hour_remaining_percent: Some(100),
+                weekly_remaining_percent: Some(100),
+                monthly_remaining_percent: Some(100),
+                ..UsageSnapshot::default()
+            };
+            assert!(
+                !is_current_account_usable(&usage),
+                "{plan} should be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn paid_plans_and_missing_plan_keep_quota_rules() {
+        for plan in [
+            None,
+            Some("Plus".into()),
+            Some("Pro".into()),
+            Some("Team".into()),
+        ] {
+            let usage = UsageSnapshot {
+                plan: plan.clone(),
+                five_hour_remaining_percent: Some(80),
+                weekly_remaining_percent: Some(40),
+                ..UsageSnapshot::default()
+            };
+            assert!(
+                is_current_account_usable(&usage),
+                "{plan:?} should stay usable"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_keep_current_free_account() {
+        let state = State {
+            version: 1,
+            accounts: vec![
+                AccountRecord {
+                    id: "current".into(),
+                    email: "current@example.com".into(),
+                    updated_at: 1,
+                    ..AccountRecord::default()
+                },
+                AccountRecord {
+                    id: "paid".into(),
+                    email: "paid@example.com".into(),
+                    updated_at: 1,
+                    ..AccountRecord::default()
+                },
+            ],
+            usage_cache: BTreeMap::from([
+                (
+                    "current".into(),
+                    UsageSnapshot {
+                        plan: Some("Free".into()),
+                        five_hour_remaining_percent: Some(100),
+                        weekly_remaining_percent: Some(100),
+                        ..UsageSnapshot::default()
+                    },
+                ),
+                (
+                    "paid".into(),
+                    UsageSnapshot {
+                        plan: Some("Plus".into()),
+                        five_hour_remaining_percent: Some(30),
+                        weekly_remaining_percent: Some(40),
+                        ..UsageSnapshot::default()
+                    },
+                ),
+            ]),
+            repo_sync: Default::default(),
+        };
+        let live = LiveIdentity {
+            email: "current@example.com".into(),
+            account_id: None,
+            scodex_account_id: None,
+        };
+
+        assert!(choose_current_account(&state, Some(&live)).is_none());
+        assert_eq!(
+            choose_best_account(&state).map(|item| item.id.as_str()),
+            Some("paid")
+        );
+    }
+
+    #[test]
+    fn monthly_only_quota_is_not_scored_as_five_hour() {
+        let monthly = UsageSnapshot {
+            plan: Some("Plus".into()),
+            monthly_remaining_percent: Some(10),
+            ..UsageSnapshot::default()
+        };
+        let five_hour = UsageSnapshot {
+            plan: Some("Plus".into()),
+            five_hour_remaining_percent: Some(10),
+            ..UsageSnapshot::default()
+        };
+
+        assert!(is_current_account_usable(&monthly));
+        assert!(!is_current_account_usable(&five_hour));
+        assert!(!is_current_account_usable(&UsageSnapshot {
+            plan: Some("Plus".into()),
+            monthly_remaining_percent: Some(5),
+            ..UsageSnapshot::default()
+        }));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 
-use super::auth::normalize_plan;
+use super::auth::{decode_identity, normalize_plan};
 use super::{CodexAdapter, now_ts};
 use crate::core::state::{AccountRecord, State, UsageSnapshot};
 
@@ -56,6 +56,7 @@ impl CodexAdapter {
                 self.fetch_usage_for_account(account, previous)
             });
         for (account_id, usage) in refreshed {
+            self.sync_account_plan_after_refresh(state, &account_id, &usage);
             state.usage_cache.insert(account_id, usage);
         }
     }
@@ -69,9 +70,47 @@ impl CodexAdapter {
             state.usage_cache.remove(&account.id);
             return UsageSnapshot::default();
         }
-        let usage = self.fetch_usage_for_account(account, state.usage_cache.get(&account.id));
-        state.usage_cache.insert(account.id.clone(), usage.clone());
+        let account_id = account.id.clone();
+        let usage = self.fetch_usage_for_account(account, state.usage_cache.get(&account_id));
+        self.sync_account_plan_after_refresh(state, &account_id, &usage);
+        state.usage_cache.insert(account_id, usage.clone());
         usage
+    }
+
+    fn sync_account_plan_after_refresh(
+        &self,
+        state: &mut State,
+        account_id: &str,
+        usage: &UsageSnapshot,
+    ) {
+        let Some(account) = state
+            .accounts
+            .iter()
+            .find(|item| item.id == account_id && item.is_subscription())
+        else {
+            return;
+        };
+        let auth_path = PathBuf::from(&account.auth_path);
+        let jwt_plan = self
+            .read_auth_json(&auth_path)
+            .ok()
+            .and_then(|auth| decode_identity(&auth).ok())
+            .and_then(|identity| identity.plan)
+            .filter(|plan| !plan.trim().is_empty());
+        let api_plan = (usage.last_sync_error.is_none() && !usage.needs_relogin)
+            .then(|| usage.plan.clone())
+            .flatten()
+            .filter(|plan| !plan.trim().is_empty());
+        let Some(slot) = state.accounts.iter_mut().find(|item| item.id == account_id) else {
+            return;
+        };
+        // id_token 已能反映降级；额度接口成功时再以 plan_type 为准
+        if let Some(plan) = jwt_plan {
+            slot.plan = Some(plan);
+        }
+        if let Some(plan) = api_plan {
+            slot.plan = Some(plan);
+        }
     }
 
     fn fetch_usage_for_account(
@@ -82,11 +121,9 @@ impl CodexAdapter {
         let auth_path = Path::new(&account.auth_path);
         let config_path = account.config_path.as_ref().map(PathBuf::from);
         let timestamp = now_ts();
+        // 失败时不把账号记录里的旧套餐写回额度快照
         let merge_err = |err: String| {
-            merge_usage_with_previous(
-                previous,
-                make_error_snapshot(account.plan.clone(), timestamp, err),
-            )
+            merge_usage_with_previous(previous, make_error_snapshot(None, timestamp, err))
         };
 
         let mut auth = match self.read_auth_json(auth_path) {
@@ -126,7 +163,7 @@ impl CodexAdapter {
                 if retried_after_unauthorized {
                     return merge_usage_with_previous(
                         previous,
-                        make_relogin_snapshot(account.plan.clone(), timestamp),
+                        make_relogin_snapshot(None, timestamp),
                     );
                 }
                 retried_after_unauthorized = true;
@@ -138,7 +175,7 @@ impl CodexAdapter {
                     Err(_) => {
                         return merge_usage_with_previous(
                             previous,
-                            make_relogin_snapshot(account.plan.clone(), timestamp),
+                            make_relogin_snapshot(None, timestamp),
                         );
                     }
                 }
@@ -321,6 +358,8 @@ fn merge_usage_with_previous(
     merge_quota_field!(weekly_refresh_at);
     merge_quota_field!(five_hour_remaining_percent);
     merge_quota_field!(five_hour_refresh_at);
+    merge_quota_field!(monthly_remaining_percent);
+    merge_quota_field!(monthly_refresh_at);
     merge_quota_field!(credits_balance);
 
     if update.last_synced_at.is_some() {
@@ -407,6 +446,7 @@ fn normalize_usage_response(payload: &Value) -> UsageSnapshot {
 
     let mut five_hour = None;
     let mut weekly = None;
+    let mut monthly = None;
     for window in windows.into_iter().flatten() {
         // null / 非 object 不能当成 5h 耗尽；weekly-only 账号的 secondary_window 就是 null
         if !window.is_object() {
@@ -428,13 +468,13 @@ fn normalize_usage_response(payload: &Value) -> UsageSnapshot {
                     five_hour = Some(snapshot);
                 }
             }
-            WindowRole::Unknown => {
-                if five_hour.is_none() {
-                    five_hour = Some(snapshot);
-                } else if weekly.is_none() {
-                    weekly = Some(snapshot);
+            WindowRole::Monthly => {
+                if monthly.is_none() {
+                    monthly = Some(snapshot);
                 }
             }
+            // 未识别的时长不能塞进 5h，否则月额度会被当成 5 小时额度
+            WindowRole::Unknown => {}
         }
     }
 
@@ -454,6 +494,8 @@ fn normalize_usage_response(payload: &Value) -> UsageSnapshot {
         five_hour_refresh_at: five_hour.and_then(|item| item.reset_at),
         weekly_remaining_percent: weekly.as_ref().and_then(|item| item.remaining_percent),
         weekly_refresh_at: weekly.and_then(|item| item.reset_at),
+        monthly_remaining_percent: monthly.as_ref().and_then(|item| item.remaining_percent),
+        monthly_refresh_at: monthly.and_then(|item| item.reset_at),
         credits_balance,
         ..UsageSnapshot::default()
     }
@@ -480,6 +522,7 @@ fn map_window(window: &Value) -> (WindowSnapshot, WindowRole) {
     let role = match limit_window_seconds {
         18_000 => WindowRole::FiveHour,
         604_800 => WindowRole::Weekly,
+        2_592_000 => WindowRole::Monthly,
         _ => WindowRole::Unknown,
     };
     (
@@ -509,6 +552,7 @@ struct WindowSnapshot {
 enum WindowRole {
     FiveHour,
     Weekly,
+    Monthly,
     Unknown,
 }
 
@@ -606,6 +650,46 @@ mod tests {
     }
 
     #[test]
+    fn normalize_usage_response_maps_thirty_day_window_to_monthly() {
+        let usage = normalize_usage_response(&serde_json::json!({
+            "plan_type": "free",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 2592000,
+                    "reset_at": 1794815857
+                },
+                "secondary_window": null
+            }
+        }));
+
+        assert_eq!(usage.plan.as_deref(), Some("Free"));
+        assert_eq!(usage.monthly_remaining_percent, Some(100));
+        assert_eq!(usage.monthly_refresh_at.as_deref(), Some("1794815857"));
+        assert_eq!(usage.five_hour_remaining_percent, None);
+        assert_eq!(usage.weekly_remaining_percent, None);
+    }
+
+    #[test]
+    fn normalize_usage_response_ignores_unknown_window_duration() {
+        let usage = normalize_usage_response(&serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 12345,
+                    "reset_at": 1794815857
+                },
+                "secondary_window": null
+            }
+        }));
+
+        assert_eq!(usage.five_hour_remaining_percent, None);
+        assert_eq!(usage.weekly_remaining_percent, None);
+        assert_eq!(usage.monthly_remaining_percent, None);
+    }
+
+    #[test]
     fn refresh_all_accounts_removes_api_usage_without_fetching() {
         let adapter = CodexAdapter;
         let mut state = State {
@@ -639,6 +723,8 @@ mod tests {
             five_hour_refresh_at: Some("2026-04-20T15:32:00Z".into()),
             weekly_remaining_percent: Some(47),
             weekly_refresh_at: Some("2026-04-21T09:39:00Z".into()),
+            monthly_remaining_percent: Some(80),
+            monthly_refresh_at: Some("2026-05-20T00:00:00Z".into()),
             credits_balance: Some(12.5),
             ..Default::default()
         };
@@ -655,6 +741,8 @@ mod tests {
         assert_eq!(merged.five_hour_refresh_at, None);
         assert_eq!(merged.weekly_remaining_percent, None);
         assert_eq!(merged.weekly_refresh_at, None);
+        assert_eq!(merged.monthly_remaining_percent, None);
+        assert_eq!(merged.monthly_refresh_at, None);
         assert_eq!(merged.credits_balance, None);
         assert_eq!(merged.last_sync_error.as_deref(), Some("quota api failed"));
     }
@@ -838,19 +926,17 @@ mod tests {
         assert_eq!(snap.last_sync_error.as_deref(), Some("no plan"));
     }
 
-    /// merge 后错误快照的 plan 字段被正确携带到 merged 结果
+    /// 刷新失败不携带旧账号套餐，合并后保留上一次成功读到的 plan
     #[test]
-    fn merge_error_snapshot_preserves_plan_from_update() {
+    fn merge_error_snapshot_keeps_previous_plan_when_update_plan_is_empty() {
         let previous = UsageSnapshot {
-            plan: Some("Plus".into()),
+            plan: Some("Free".into()),
             weekly_remaining_percent: Some(50),
             ..Default::default()
         };
-        let update = make_error_snapshot(Some("Pro".into()), 999, "fetch failed".into());
+        let update = make_error_snapshot(None, 999, "fetch failed".into());
         let merged = merge_usage_with_previous(Some(&previous), update);
-        // plan 来自 update（Some 值覆盖）
-        assert_eq!(merged.plan.as_deref(), Some("Pro"));
-        // quota 应被清零
+        assert_eq!(merged.plan.as_deref(), Some("Free"));
         assert!(merged.weekly_remaining_percent.is_none());
         assert_eq!(merged.last_sync_error.as_deref(), Some("fetch failed"));
     }
@@ -930,6 +1016,27 @@ mod tests {
                 "access_token": fake_jwt(access_payload),
                 "refresh_token": refresh,
                 "id_token": fake_jwt(&format!(r#"{{"email":"{email}"}}"#)),
+                "account_id": "acct-1"
+            }
+        })
+    }
+
+    fn chatgpt_auth_with_plan(
+        email: &str,
+        access_payload: &str,
+        refresh: &str,
+        last_refresh: &str,
+        plan: &str,
+    ) -> serde_json::Value {
+        let id_payload = format!(
+            r#"{{"email":"{email}","https://api.openai.com/auth":{{"chatgpt_plan_type":"{plan}"}}}}"#
+        );
+        serde_json::json!({
+            "last_refresh": last_refresh,
+            "tokens": {
+                "access_token": fake_jwt(access_payload),
+                "refresh_token": refresh,
+                "id_token": fake_jwt(&id_payload),
                 "account_id": "acct-1"
             }
         })
@@ -1255,6 +1362,128 @@ mod tests {
         assert!(usage.needs_relogin);
         assert!(usage.weekly_remaining_percent.is_none());
         assert!(usage.five_hour_remaining_percent.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refresh_success_writes_api_plan_over_jwt_plan() {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp = std::env::temp_dir().join(format!("scodex-usage-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let email = "a@example.com";
+        let mut account = write_account_home(
+            &tmp,
+            email,
+            &chatgpt_auth_with_plan(
+                email,
+                r#"{"exp":2000000000}"#,
+                "refresh",
+                "2026-09-04T01:01:08Z",
+                "plus",
+            ),
+        );
+        account.plan = Some("Pro".into());
+        let live_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&live_home).unwrap();
+
+        let base = spawn_json_server(|request_line, _, _| {
+            if request_line.contains("/wham/usage") {
+                return (
+                    200,
+                    serde_json::json!({
+                        "plan_type": "free",
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 0,
+                                "limit_window_seconds": 2592000,
+                                "reset_at": 1794815857
+                            },
+                            "secondary_window": null
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            (404, r#"{"error":"missing"}"#.into())
+        });
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        let _usage = EnvGuard::set("CODEX_USAGE_BASE_URL", format!("{base}/backend-api"));
+
+        let mut state = State {
+            version: 1,
+            accounts: vec![account.clone()],
+            usage_cache: BTreeMap::new(),
+            repo_sync: Default::default(),
+        };
+        CodexAdapter.refresh_all_accounts(&mut state);
+        let usage = state.usage_cache.get(&account.id).unwrap();
+        assert_eq!(usage.plan.as_deref(), Some("Free"));
+        assert_eq!(usage.monthly_remaining_percent, Some(100));
+        assert_eq!(usage.five_hour_remaining_percent, None);
+        assert_eq!(usage.weekly_remaining_percent, None);
+        assert_eq!(state.accounts[0].plan.as_deref(), Some("Free"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refresh_failure_keeps_usage_plan_and_overwrites_record_from_jwt() {
+        use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
+
+        let tmp =
+            std::env::temp_dir().join(format!("scodex-usage-plan-err-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let email = "a@example.com";
+        let mut account = write_account_home(
+            &tmp,
+            email,
+            &chatgpt_auth_with_plan(
+                email,
+                r#"{"exp":2000000000}"#,
+                "refresh",
+                "2026-09-04T01:01:08Z",
+                "free",
+            ),
+        );
+        account.plan = Some("Pro".into());
+        let live_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&live_home).unwrap();
+
+        let base = spawn_json_server(|request_line, _, _| {
+            if request_line.contains("/wham/usage") {
+                return (500, r#"{"error":"unavailable"}"#.into());
+            }
+            (404, r#"{"error":"missing"}"#.into())
+        });
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = EnvGuard::set("CODEX_HOME", &live_home);
+        let _usage = EnvGuard::set("CODEX_USAGE_BASE_URL", format!("{base}/backend-api"));
+
+        let mut state = State {
+            version: 1,
+            accounts: vec![account.clone()],
+            usage_cache: BTreeMap::from([(
+                account.id.clone(),
+                UsageSnapshot {
+                    plan: Some("Free".into()),
+                    five_hour_remaining_percent: Some(100),
+                    weekly_remaining_percent: Some(40),
+                    ..UsageSnapshot::default()
+                },
+            )]),
+            repo_sync: Default::default(),
+        };
+        CodexAdapter.refresh_all_accounts(&mut state);
+        let usage = state.usage_cache.get(&account.id).unwrap();
+        assert_eq!(usage.plan.as_deref(), Some("Free"));
+        assert!(usage.last_sync_error.is_some(), "{usage:?}");
+        assert_eq!(usage.five_hour_remaining_percent, None);
+        assert_eq!(state.accounts[0].plan.as_deref(), Some("Free"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

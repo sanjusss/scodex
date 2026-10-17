@@ -561,14 +561,24 @@ fn persist_repo_from_cli(
     Ok(())
 }
 
+fn selection_quotas(usage: &UsageSnapshot) -> String {
+    if usage.weekly_remaining_percent.is_none() && usage.monthly_remaining_percent.is_some() {
+        format!(
+            "monthly={}, 5h={}",
+            format_percent(usage.monthly_remaining_percent),
+            format_percent(usage.five_hour_remaining_percent),
+        )
+    } else {
+        format!(
+            "weekly={}, 5h={}",
+            format_percent(usage.weekly_remaining_percent),
+            format_percent(usage.five_hour_remaining_percent),
+        )
+    }
+}
+
 fn print_selection(prefix: &str, account: &AccountRecord, usage: &UsageSnapshot) {
-    println!(
-        "{} {} [weekly={}, 5h={}]",
-        prefix,
-        account.email,
-        format_percent(usage.weekly_remaining_percent),
-        format_percent(usage.five_hour_remaining_percent),
-    );
+    println!("{} {} [{}]", prefix, account.email, selection_quotas(usage),);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1345,8 +1355,9 @@ mod tests {
 
     use super::{
         AccountType, Cli, Command, HelpTopic, codex_launch_args, render_help_with_lang,
-        resolve_repo_source,
+        resolve_repo_source, selection_quotas,
     };
+    use crate::core::state::UsageSnapshot;
 
     #[test]
     fn api_launch_disables_response_storage_and_apps() {
@@ -1370,6 +1381,26 @@ mod tests {
         let args = codex_launch_args(AccountType::Subscription, &[OsString::from("--model=test")]);
 
         assert_eq!(args, [OsString::from("--model=test")]);
+    }
+
+    #[test]
+    fn selection_quotas_labels_monthly_quota_separately_from_five_hour() {
+        let monthly_only = UsageSnapshot {
+            monthly_remaining_percent: Some(100),
+            ..UsageSnapshot::default()
+        };
+        let weekly = UsageSnapshot {
+            weekly_remaining_percent: Some(84),
+            five_hour_remaining_percent: Some(20),
+            monthly_remaining_percent: Some(100),
+            ..UsageSnapshot::default()
+        };
+
+        assert_eq!(
+            selection_quotas(&monthly_only),
+            format!("monthly=100%, 5h={}", super::format_percent(None))
+        );
+        assert_eq!(selection_quotas(&weekly), "weekly=84%, 5h=20%");
     }
 
     #[test]
