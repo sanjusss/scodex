@@ -299,13 +299,13 @@ impl CodexAdapter {
         if self.read_live_identity().as_ref() == identity_before {
             return Ok(());
         }
-        if !codex_app_server_daemon_running(home) {
+        let Some(codex_bin) = find_codex_bin() else {
+            return Ok(());
+        };
+        if !codex_app_server_daemon_running(&codex_bin, home) {
             return Ok(());
         }
         let ui = crate::core::ui::messages();
-        let Some(codex_bin) = find_codex_bin() else {
-            bail!("{}", ui.app_server_restart_missing_codex());
-        };
         println!("{}", ui.app_server_restarting());
         let status = Command::new(&codex_bin)
             .args(["app-server", "daemon", "restart"])
@@ -1335,9 +1335,13 @@ mod tests {
         Ok(())
     }
 
-    fn write_codex_stub(path: &Path, exit_code: i32) -> Result<()> {
+    fn write_codex_stub(
+        path: &Path,
+        daemon_version_exit_code: i32,
+        restart_exit_code: i32,
+    ) -> Result<()> {
         let body = format!(
-            "#!/bin/sh\nif [ -n \"$SCODEX_RESTART_RECORD\" ]; then\n  printf '%s\\n' \"$@\" > \"$SCODEX_RESTART_RECORD\"\n  printf '%s\\n' \"$CODEX_HOME\" >> \"$SCODEX_RESTART_RECORD\"\nfi\nexit {exit_code}\n"
+            "#!/bin/sh\nif [ -n \"$SCODEX_RESTART_RECORD\" ]; then\n  printf '%s\\n' \"$@\" >> \"$SCODEX_RESTART_RECORD\"\n  printf '%s\\n' \"$CODEX_HOME\" >> \"$SCODEX_RESTART_RECORD\"\nfi\nif [ \"$3\" = \"version\" ]; then\n  exit {daemon_version_exit_code}\nfi\nexit {restart_exit_code}\n"
         );
         fs::write(path, body)?;
         #[cfg(unix)]
@@ -1381,7 +1385,7 @@ mod tests {
         write_running_daemon_pid(&live_home)?;
         let record = tmp.join("record.txt");
         let stub = tmp.join("codex-stub");
-        write_codex_stub(&stub, 0)?;
+        write_codex_stub(&stub, 0, 0)?;
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _home = EnvGuard::set("CODEX_HOME", &live_home);
@@ -1390,17 +1394,26 @@ mod tests {
         switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "b@example.com"))?;
 
         let recorded = fs::read_to_string(&record)?;
-        let mut lines = recorded.lines();
-        assert_eq!(lines.next(), Some("app-server"));
-        assert_eq!(lines.next(), Some("daemon"));
-        assert_eq!(lines.next(), Some("restart"));
-        assert_eq!(lines.next(), Some(live_home.to_str().unwrap()));
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            vec![
+                "app-server",
+                "daemon",
+                "version",
+                live_home.to_str().unwrap(),
+                "app-server",
+                "daemon",
+                "restart",
+                live_home.to_str().unwrap(),
+            ]
+        );
         fs::remove_dir_all(&tmp)?;
         Ok(())
     }
 
     #[test]
-    fn switch_account_skips_daemon_restart_when_daemon_is_not_running() -> Result<()> {
+    fn switch_account_skips_daemon_restart_with_stale_pid_when_daemon_is_not_running() -> Result<()>
+    {
         use crate::adapters::codex::{EnvGuard, TEST_ENV_LOCK};
 
         let tmp = std::env::temp_dir().join(format!("scodex-switch-no-daemon-{}", Uuid::new_v4()));
@@ -1419,9 +1432,10 @@ mod tests {
             &live_auth,
             chatgpt_auth_file("a@example.com", "live-a", "2026-09-04T01:01:08Z").to_string(),
         )?;
+        write_running_daemon_pid(&live_home)?;
         let record = tmp.join("record.txt");
         let stub = tmp.join("codex-stub");
-        write_codex_stub(&stub, 0)?;
+        write_codex_stub(&stub, 1, 0)?;
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _home = EnvGuard::set("CODEX_HOME", &live_home);
@@ -1429,7 +1443,9 @@ mod tests {
         let _record = EnvGuard::set("SCODEX_RESTART_RECORD", &record);
         switch_with_empty_state(&tmp, &subscription_record(&stored_auth, "b@example.com"))?;
 
-        assert!(!record.exists());
+        let recorded = fs::read_to_string(&record)?;
+        assert!(recorded.lines().any(|line| line == "version"));
+        assert!(!recorded.lines().any(|line| line == "restart"));
         fs::remove_dir_all(&tmp)?;
         Ok(())
     }
@@ -1457,7 +1473,7 @@ mod tests {
         )?;
         write_running_daemon_pid(&live_home)?;
         let stub = tmp.join("codex-stub");
-        write_codex_stub(&stub, 1)?;
+        write_codex_stub(&stub, 0, 1)?;
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _home = EnvGuard::set("CODEX_HOME", &live_home);

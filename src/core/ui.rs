@@ -165,10 +165,6 @@ static MSG_APP_SERVER_RESTART_FAILED: Msg = Msg {
     en: "failed to restart Codex app-server, exit status {status}",
     zh: "重启 Codex app-server 失败，退出码：{status}",
 };
-static MSG_APP_SERVER_RESTART_MISSING_CODEX: Msg = Msg {
-    en: "codex was not found, so the running app-server was not restarted",
-    zh: "未找到 codex，正在运行的 app-server 没有重启",
-};
 static MSG_SELECTION_WOULD_SELECT: Msg = Msg {
     en: "Would select",
     zh: "将会选择",
@@ -586,10 +582,6 @@ impl Messages {
             &MSG_APP_SERVER_RESTART_FAILED,
             &[("{status}", status.to_string())],
         )
-    }
-
-    pub fn app_server_restart_missing_codex(&self) -> &'static str {
-        self.pick(&MSG_APP_SERVER_RESTART_MISSING_CODEX)
     }
 
     pub fn selection_would_select(&self) -> &'static str {
